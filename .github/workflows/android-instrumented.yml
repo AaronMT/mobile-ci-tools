@@ -1,0 +1,101 @@
+name: Run Android Instrumented UI Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildAPK:
+        description: 'Path to the build APK'
+        required: true
+      androidTestAPK:
+        description: 'Path to the AndroidTest APK'
+        required: true
+      androidAPI:
+        description: 'Android API Level'
+        required: true
+      androidArch:
+        description: 'Android Architecture'
+        required: true
+      androidTarget:
+        description: 'Android Target'
+        required: true
+
+jobs:
+  test-android:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4.1.7
+
+    - name: Download APKS
+      id: download_apks
+      run: |
+        echo "Downloading build APK..."
+        curl -L ${{ github.event.inputs.buildAPK }} -o build.apk
+        echo "Downloading AndroidTest APK..."
+        curl -L ${{ github.event.inputs.androidTestAPK }} -o androidTest.apk
+        echo "BUILD_APK=build.apk" >> $GITHUB_ENV
+        echo "ANDROID_TEST_APK=androidTest.apk" >> $GITHUB_ENV
+
+    - name: Enable KVM group perms
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Get Package Name from APK
+      run: |
+        PACKAGE_NAME=$($ANDROID_HOME/build-tools/34.0.0/aapt2 dump packagename $BUILD_APK)
+        echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+
+    - name: Create Test Script
+      run: |
+        echo "Creating test script..."
+        echo "#!/bin/bash" > run_tests.sh
+        echo "set -e" >> run_tests.sh
+        echo "echo Installing build APK..." >> run_tests.sh
+        echo "adb install -r \$BUILD_APK" >> run_tests.sh
+        echo "echo Installing AndroidTest APK..." >> run_tests.sh
+        echo "adb install -r \$ANDROID_TEST_APK" >> run_tests.sh
+        echo "echo Running instrumentation tests..." >> run_tests.sh
+        echo "adb shell am instrument -w -r -e debug false -e class org.mozilla.fenix.ui.MainMenuTest#openNewTabTest \${PACKAGE_NAME}.test/androidx.test.runner.AndroidJUnitRunner" >> run_tests.sh
+        echo "adb root" >> run_tests.sh
+        echo "echo Finding and copying minidumps..." >> run_tests.sh
+        echo "sleep 10" >> run_tests.sh  # Wait for 10 seconds
+        echo "PROFILE_DIR=\$(adb shell ls /data/data/$PACKAGE_NAME/files/mozilla | grep '.default')" >> run_tests.sh
+        echo "if [ -n \"\$PROFILE_DIR\" ]; then" >> run_tests.sh
+        echo "  MINIDUMP_FILE=\$(adb shell find /data/data/$PACKAGE_NAME/files/mozilla/\$PROFILE_DIR/minidumps -type f -name '*.dmp' 2>/dev/null | head -n 1)" >> run_tests.sh
+        echo "  if [ -n \"\$MINIDUMP_FILE\" ]; then" >> run_tests.sh
+        echo "    echo \"Found minidump file: \$MINIDUMP_FILE\"" >> run_tests.sh
+        echo "    mkdir -p ./minidumps" >> run_tests.sh
+        echo "    adb pull \"\$MINIDUMP_FILE\" ./minidumps/" >> run_tests.sh
+        echo "  else" >> run_tests.sh
+        echo "    echo \"No minidump file found in minidumps directory\"" >> run_tests.sh
+        echo "  fi" >> run_tests.sh
+        echo "else" >> run_tests.sh
+        echo "  echo \"No profile directory found\"" >> run_tests.sh
+        echo "fi" >> run_tests.sh
+        echo "echo Fetching logcat logs for debugging..." >> run_tests.sh
+        echo "adb logcat -d > logcat_before_pull.txt" >> run_tests.sh
+        echo "echo Finding any copying tombstones..." >> run_tests.sh
+        echo "mkdir -p ./tombstones" >> run_tests.sh  # Ensure the tombstones directory exists
+        echo "adb pull /data/tombstones/tombstone_00 ./tombstones/" >> run_tests.sh
+        chmod +x run_tests.sh
+
+    - name: Start Android Emulator
+      uses: ReactiveCircus/android-emulator-runner@v2.32.0
+      with:
+        api-level: ${{ github.event.inputs.androidAPI }}
+        arch: ${{ github.event.inputs.androidArch }}
+        profile: pixel_6
+        script: |
+         ./run_tests.sh
+        target: ${{ github.event.inputs.androidTarget }}
+
+    - name: Upload Minidumps and Logs
+      uses: actions/upload-artifact@v4.3.5
+      with:
+        name: minidumps-and-logs
+        path: |
+          ./minidumps
+          ./logcat_before_pull.txt
+          ./tombstones
